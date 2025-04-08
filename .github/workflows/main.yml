@@ -1,0 +1,703 @@
+
+# name: Terraform AWS Pipeline
+
+# on:
+#   push:
+#     branches: [ main ]
+#   pull_request:
+#     branches: [ main ]
+#   workflow_dispatch:
+#     inputs:
+#       action:
+#         description: 'Workflow action to perform'
+#         required: true
+#         default: 'apply'
+#         type: choice
+#         options:
+#           - apply
+#           - plan-only
+
+# permissions:
+#   contents: read
+#   issues: write
+#   pull-requests: write
+
+# env:
+#   TF_LOG: INFO
+
+# jobs:
+#   plan:
+#     name: Terraform Plan
+#     runs-on: ubuntu-latest
+#     steps:
+#       - name: Checkout code
+#         uses: actions/checkout@v3
+
+#       - name: Setup Terraform
+#         uses: hashicorp/setup-terraform@v2
+#         with:
+#           terraform_version: "1.5.7"
+#           terraform_wrapper: false
+
+#       - name: Configure AWS credentials
+#         uses: aws-actions/configure-aws-credentials@v2
+#         with:
+#           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+#           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+#           aws-region: ${{ secrets.AWS_REGION }}
+
+#       - name: Terraform Init
+#         run: terraform init -lock=false
+
+#       - name: Terraform Validate
+#         run: terraform validate
+
+#       - name: Terraform Plan
+#         run: |
+#           echo "::group::Running Terraform Plan"
+#           terraform plan -lock=false -no-color -out=tfplan
+#           echo "::endgroup::"
+
+#       - name: Generate Plan Output
+#         run: |
+#           echo "::group::Generating Plan Output"
+#           terraform show -no-color tfplan > plan_full.txt
+          
+#           # Extract plan summary for issue
+#           {
+#             echo "# 📊 Terraform Plan Summary"
+#             echo ""
+#             echo "## Changes Overview"
+#             echo "```diff"
+#             grep -E '^\s*[+~-]' plan_full.txt | head -n 50 || echo "No changes detected"
+#             echo "```"
+            
+#             # Count resources by type of change
+#             RESOURCES_ADD=$(grep -E '^\s*\+' plan_full.txt | wc -l)
+#             RESOURCES_CHANGE=$(grep -E '^\s*~' plan_full.txt | wc -l)
+#             RESOURCES_DESTROY=$(grep -E '^\s*-' plan_full.txt | wc -l)
+            
+#             echo ""
+#             echo "## Resource Changes"
+#             echo "- 🟢 **Resources to add:** $RESOURCES_ADD"
+#             echo "- 🟡 **Resources to change:** $RESOURCES_CHANGE"
+#             echo "- 🔴 **Resources to destroy:** $RESOURCES_DESTROY"
+#             echo ""
+            
+#             # Get plan summary line
+#             echo "## Plan Summary"
+#             echo "```"
+#             grep -E 'Plan:|No changes' plan_full.txt | head -n 1 || echo "Plan summary not found"
+#             echo "```"
+#           } > plan_issue.md
+          
+#           echo "::endgroup::"
+
+#       - name: Upload Plan Artifacts
+#         uses: actions/upload-artifact@v4
+#         with:
+#           name: terraform-plans
+#           path: |
+#             tfplan
+#             plan_full.txt
+#             plan_issue.md
+#           retention-days: 7
+
+#       - name: Create GitHub Issue for Approval
+#         if: github.event.inputs.action != 'plan-only'
+#         id: create_issue
+#         uses: actions/github-script@v6
+#         with:
+#           github-token: ${{ secrets.GITHUB_TOKEN }}
+#           script: |
+#             const fs = require('fs');
+#             const planSummary = fs.readFileSync('plan_issue.md', 'utf8');
+            
+#             const issue = await github.rest.issues.create({
+#               owner: context.repo.owner,
+#               repo: context.repo.repo,
+#               title: `🔍 Terraform Plan Review Required - Run #${context.runId}`,
+#               body: `
+#             # Terraform Plan Approval Request
+            
+#             ## 📋 Details
+#             **Workflow:** ${context.workflow}
+#             **Run ID:** [#${context.runId}](https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})
+#             **Triggered By:** @${context.actor}
+#             **Triggered At:** ${new Date().toISOString()}
+            
+#             ${planSummary}
+            
+#             ## ✅ Does this plan look good?
+            
+#             Please review the plan and respond with one of the following:
+            
+#             - Comment with \`yes\` to approve and apply these changes
+#             - Comment with \`no\` to reject these changes
+            
+#             ### ⏰ Timeout
+#             This approval request will automatically expire after 60 minutes if no response is received.
+#             `
+#             });
+            
+#             console.log(`Created issue #${issue.data.number} for approval`);
+#             return issue.data.number;
+#           result-encoding: string
+
+#       - name: Save Issue Number
+#         if: github.event.inputs.action != 'plan-only'
+#         run: echo "${{ steps.create_issue.outputs.result }}" > issue_number.txt
+
+#       - name: Upload Issue Number
+#         if: github.event.inputs.action != 'plan-only'
+#         uses: actions/upload-artifact@v4
+#         with:
+#           name: issue-number
+#           path: issue_number.txt
+#           retention-days: 7
+
+#   wait_for_approval:
+#     name: Wait for Approval
+#     needs: plan
+#     runs-on: ubuntu-latest
+#     if: github.event.inputs.action != 'plan-only'
+#     steps:
+#       - name: Download Issue Number
+#         uses: actions/download-artifact@v4
+#         with:
+#           name: issue-number
+#           path: .
+
+#       - name: Get Issue Number
+#         id: get_issue
+#         run: echo "issue_number=$(cat issue_number.txt)" >> $GITHUB_OUTPUT
+
+#       - name: Wait for Approval
+#         id: wait_for_approval
+#         uses: actions/github-script@v6
+#         with:
+#           github-token: ${{ secrets.GITHUB_TOKEN }}
+#           script: |
+#             const issueNumber = parseInt('${{ steps.get_issue.outputs.issue_number }}');
+#             console.log(`Checking approval status for issue #${issueNumber}`);
+            
+#             // Poll for approval comments
+#             let approved = false;
+#             let rejected = false;
+#             let approver = '';
+#             let attempts = 0;
+#             const maxAttempts = 30; // 30 minutes (30 polling cycles)
+            
+#             while (attempts < maxAttempts && !approved && !rejected) {
+#               console.log(`Polling attempt ${attempts + 1} of ${maxAttempts}`);
+              
+#               const { data: comments } = await github.rest.issues.listComments({
+#                 owner: context.repo.owner,
+#                 repo: context.repo.repo,
+#                 issue_number: issueNumber
+#               });
+              
+#               // Check for approval or rejection comments
+#               for (const comment of comments) {
+#                 const body = comment.body.trim().toLowerCase();
+#                 if (body === 'yes') {
+#                   approved = true;
+#                   approver = comment.user.login;
+#                   break;
+#                 } else if (body === 'no') {
+#                   rejected = true;
+#                   approver = comment.user.login;
+#                   break;
+#                 }
+#               }
+              
+#               if (!approved && !rejected) {
+#                 console.log('No approval or rejection found yet, waiting...');
+#                 await new Promise(resolve => setTimeout(resolve, 60000)); // Wait 1 minute
+#                 attempts++;
+#               }
+#             }
+            
+#             // Add status comment to the issue
+#             if (approved) {
+#               await github.rest.issues.createComment({
+#                 owner: context.repo.owner,
+#                 repo: context.repo.repo,
+#                 issue_number: issueNumber,
+#                 body: `✅ **APPROVED** by @${approver}. Proceeding with apply.`
+#               });
+              
+#               await github.rest.issues.update({
+#                 owner: context.repo.owner,
+#                 repo: context.repo.repo,
+#                 issue_number: issueNumber,
+#                 state: 'closed',
+#                 state_reason: 'completed'
+#               });
+              
+#               return 'approved';
+#             } else if (rejected) {
+#               await github.rest.issues.createComment({
+#                 owner: context.repo.owner,
+#                 repo: context.repo.repo,
+#                 issue_number: issueNumber,
+#                 body: `❌ **REJECTED** by @${approver}. Apply will not proceed.`
+#               });
+              
+#               await github.rest.issues.update({
+#                 owner: context.repo.owner,
+#                 repo: context.repo.repo,
+#                 issue_number: issueNumber,
+#                 state: 'closed',
+#                 state_reason: 'not_planned'
+#               });
+              
+#               return 'rejected';
+#             } else {
+#               await github.rest.issues.createComment({
+#                 owner: context.repo.owner,
+#                 repo: context.repo.repo,
+#                 issue_number: issueNumber,
+#                 body: `⏱️ **TIMEOUT** - No response received within 30 minutes. Apply will not proceed.`
+#               });
+              
+#               await github.rest.issues.update({
+#                 owner: context.repo.owner,
+#                 repo: context.repo.repo,
+#                 issue_number: issueNumber,
+#                 state: 'closed',
+#                 state_reason: 'not_planned'
+#               });
+              
+#               return 'timeout';
+#             }
+#           result-encoding: string
+
+#       - name: Check Approval Result
+#         id: check_result
+#         run: |
+#           if [[ "${{ steps.wait_for_approval.outputs.result }}" != "approved" ]]; then
+#             echo "::error::Plan was not approved. Apply will not proceed."
+#             exit 1
+#           fi
+
+#   apply:
+#     name: Terraform Apply
+#     needs: wait_for_approval
+#     runs-on: ubuntu-latest
+#     if: github.event.inputs.action != 'plan-only'
+#     steps:
+#       - name: Checkout code
+#         uses: actions/checkout@v3
+
+#       - name: Download Plan Artifacts
+#         uses: actions/download-artifact@v4
+#         with:
+#           name: terraform-plans
+#           path: .
+
+#       - name: Setup Terraform
+#         uses: hashicorp/setup-terraform@v2
+#         with:
+#           terraform_version: "1.5.7"
+#           terraform_wrapper: false
+
+#       - name: Configure AWS credentials
+#         uses: aws-actions/configure-aws-credentials@v2
+#         with:
+#           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+#           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+#           aws-region: ${{ secrets.AWS_REGION }}
+
+#       - name: Terraform Init
+#         run: terraform init -lock=false
+
+#       - name: Terraform Apply
+#         run: |
+#           echo "::group::Applying Terraform Changes"
+#           chmod +x tfplan
+#           terraform apply -auto-approve -lock=false tfplan
+#           echo "::endgroup::"
+
+#       - name: Download Issue Number
+#         uses: actions/download-artifact@v4
+#         with:
+#           name: issue-number
+#           path: .
+
+#       - name: Get Issue Number
+#         id: get_issue
+#         run: echo "issue_number=$(cat issue_number.txt)" >> $GITHUB_OUTPUT
+
+#       - name: Update Issue with Results
+#         if: always()
+#         uses: actions/github-script@v6
+#         with:
+#           github-token: ${{ secrets.GITHUB_TOKEN }}
+#           script: |
+#             const issueNumber = parseInt('${{ steps.get_issue.outputs.issue_number }}');
+#             const success = '${{ job.status }}' === 'success';
+            
+#             await github.rest.issues.createComment({
+#               owner: context.repo.owner,
+#               repo: context.repo.repo,
+#               issue_number: issueNumber,
+#               body: `
+#             ## Terraform Apply Results
+            
+#             **Status:** ${success ? '✅ Success' : '❌ Failed'}
+#             **Workflow Run:** [#${context.runId}](https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})
+#             **Completed At:** ${new Date().toISOString()}
+#             `
+#             });
+name: Terraform AWS Pipeline
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Workflow action to perform'
+        required: true
+        default: 'apply'
+        type: choice
+        options:
+          - apply
+          - plan-only
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
+env:
+  TF_LOG: INFO
+
+jobs:
+  plan:
+    name: Terraform Plan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: "1.5.7"
+          terraform_wrapper: false
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Terraform Init
+        run: terraform init -lock=false
+
+      - name: Terraform Validate
+        run: terraform validate
+
+      - name: Terraform Plan
+        run: |
+          echo "::group::Running Terraform Plan"
+          terraform plan -lock=false -no-color -out=tfplan
+          echo "::endgroup::"
+
+      - name: Generate Plan Output
+        run: |
+          echo "::group::Generating Plan Output"
+          terraform show -no-color tfplan > plan_full.txt
+          
+          # Extract plan summary for issue
+          {
+            echo "# 📊 Terraform Plan Summary"
+            echo ""
+            echo "## Changes Overview"
+            echo "```diff"
+            grep -E '^\s*[+~-]' plan_full.txt | head -n 50 || echo "No changes detected"
+            echo "```"
+            
+            # Count resources by type of change
+            RESOURCES_ADD=$(grep -E '^\s*\+' plan_full.txt | wc -l)
+            RESOURCES_CHANGE=$(grep -E '^\s*~' plan_full.txt | wc -l)
+            RESOURCES_DESTROY=$(grep -E '^\s*-' plan_full.txt | wc -l)
+            
+            echo ""
+            echo "## Resource Changes"
+            echo "- 🟢 **Resources to add:** $RESOURCES_ADD"
+            echo "- 🟡 **Resources to change:** $RESOURCES_CHANGE"
+            echo "- 🔴 **Resources to destroy:** $RESOURCES_DESTROY"
+            echo ""
+            
+            # Get plan summary line
+            echo "## Plan Summary"
+            echo "```"
+            grep -E 'Plan:|No changes' plan_full.txt | head -n 1 || echo "Plan summary not found"
+            echo "```"
+          } > plan_issue.md
+          
+          echo "::endgroup::"
+
+      - name: Upload Plan Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: terraform-plans
+          path: |
+            tfplan
+            plan_full.txt
+            plan_issue.md
+          retention-days: 7
+
+      - name: Create GitHub Issue for Approval
+        if: github.event.inputs.action != 'plan-only'
+        id: create_issue
+        uses: actions/github-script@v6
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const planSummary = fs.readFileSync('plan_issue.md', 'utf8');
+            
+            const issue = await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `🔍 Terraform Plan Review Required - Run #${context.runId}`,
+              body: `
+            # Terraform Plan Approval Request
+            
+            ## 📋 Details
+            **Workflow:** ${context.workflow}
+            **Run ID:** [#${context.runId}](https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})
+            **Triggered By:** @${context.actor}
+            **Triggered At:** ${new Date().toISOString()}
+            
+            ${planSummary}
+            
+            ## ✅ Does this plan look good?
+            
+            Please review the plan and respond with one of the following:
+            
+            - Comment with \`yes\` to approve and apply these changes
+            - Comment with \`no\` to reject these changes
+            
+            ### ⏰ Timeout
+            This approval request will automatically expire after 60 minutes if no response is received.
+            `
+            });
+            
+            console.log(`Created issue #${issue.data.number} for approval`);
+            return issue.data.number;
+          result-encoding: string
+
+      - name: Save Issue Number
+        if: github.event.inputs.action != 'plan-only'
+        run: echo "${{ steps.create_issue.outputs.result }}" > issue_number.txt
+
+      - name: Upload Issue Number
+        if: github.event.inputs.action != 'plan-only'
+        uses: actions/upload-artifact@v4
+        with:
+          name: issue-number
+          path: issue_number.txt
+          retention-days: 7
+
+  wait_for_approval:
+    name: Wait for Approval
+    needs: plan
+    runs-on: ubuntu-latest
+    if: github.event.inputs.action != 'plan-only'
+    steps:
+      - name: Download Issue Number
+        uses: actions/download-artifact@v4
+        with:
+          name: issue-number
+          path: .
+
+      - name: Get Issue Number
+        id: get_issue
+        run: echo "issue_number=$(cat issue_number.txt)" >> $GITHUB_OUTPUT
+
+      - name: Wait for Approval
+        id: wait_for_approval
+        uses: actions/github-script@v6
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const issueNumber = parseInt('${{ steps.get_issue.outputs.issue_number }}');
+            console.log(`Checking approval status for issue #${issueNumber}`);
+            
+            // Poll for approval comments
+            let approved = false;
+            let rejected = false;
+            let approver = '';
+            let attempts = 0;
+            const maxAttempts = 30; // 30 minutes (30 polling cycles)
+            
+            while (attempts < maxAttempts && !approved && !rejected) {
+              console.log(`Polling attempt ${attempts + 1} of ${maxAttempts}`);
+              
+              const { data: comments } = await github.rest.issues.listComments({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issueNumber
+              });
+              
+              // Check for approval or rejection comments
+              for (const comment of comments) {
+                const body = comment.body.trim().toLowerCase();
+                if (body === 'yes') {
+                  approved = true;
+                  approver = comment.user.login;
+                  break;
+                } else if (body === 'no') {
+                  rejected = true;
+                  approver = comment.user.login;
+                  break;
+                }
+              }
+              
+              if (!approved && !rejected) {
+                console.log('No approval or rejection found yet, waiting...');
+                await new Promise(resolve => setTimeout(resolve, 60000)); // Wait 1 minute
+                attempts++;
+              }
+            }
+            
+            // Add status comment to the issue
+            if (approved) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issueNumber,
+                body: `✅ **APPROVED** by @${approver}. Proceeding with apply.`
+              });
+              
+              await github.rest.issues.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issueNumber,
+                state: 'closed',
+                state_reason: 'completed'
+              });
+              
+              return 'approved';
+            } else if (rejected) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issueNumber,
+                body: `❌ **REJECTED** by @${approver}. Apply will not proceed.`
+              });
+              
+              await github.rest.issues.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issueNumber,
+                state: 'closed',
+                state_reason: 'not_planned'
+              });
+              
+              return 'rejected';
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issueNumber,
+                body: `⏱️ **TIMEOUT** - No response received within 30 minutes. Apply will not proceed.`
+              });
+              
+              await github.rest.issues.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issueNumber,
+                state: 'closed',
+                state_reason: 'not_planned'
+              });
+              
+              return 'timeout';
+            }
+          result-encoding: string
+
+      - name: Check Approval Result
+        id: check_result
+        run: |
+          if [[ "${{ steps.wait_for_approval.outputs.result }}" != "approved" ]]; then
+            echo "::error::Plan was not approved. Apply will not proceed."
+            exit 1
+          fi
+
+  apply:
+    name: Terraform Apply
+    needs: wait_for_approval
+    runs-on: ubuntu-latest
+    if: github.event.inputs.action != 'plan-only'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Download Plan Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: terraform-plans
+          path: .
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: "1.5.7"
+          terraform_wrapper: false
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Terraform Init
+        run: terraform init -lock=false
+
+      - name: Terraform Apply
+        run: |
+          echo "::group::Applying Terraform Changes"
+          chmod +x tfplan
+          terraform apply -auto-approve -lock=false tfplan
+          echo "::endgroup::"
+
+      - name: Download Issue Number
+        uses: actions/download-artifact@v4
+        with:
+          name: issue-number
+          path: .
+
+      - name: Get Issue Number
+        id: get_issue
+        run: echo "issue_number=$(cat issue_number.txt)" >> $GITHUB_OUTPUT
+
+      - name: Update Issue with Results
+        if: always()
+        uses: actions/github-script@v6
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const issueNumber = parseInt('${{ steps.get_issue.outputs.issue_number }}');
+            const success = '${{ job.status }}' === 'success';
+            
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issueNumber,
+              body: `
+            ## Terraform Apply Results
+            
+            **Status:** ${success ? '✅ Success' : '❌ Failed'}
+            **Workflow Run:** [#${context.runId}](https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})
+            **Completed At:** ${new Date().toISOString()}
+            `
+            });
